@@ -81,9 +81,16 @@ export const UploadTradeView: React.FC<UploadTradeViewProps> = ({
           ctx.drawImage(img, 0, 0, w, h);
           const preferPng =
             file.type === 'image/png' && file.size <= 2 * 1024 * 1024 && w <= 1600 && h <= 1600;
-          const outUrl = preferPng
+          let outUrl = preferPng
             ? canvas.toDataURL('image/png')
-            : canvas.toDataURL('image/jpeg', 0.92);
+            : canvas.toDataURL('image/jpeg', 0.9);
+          // Stay well under Vercel Serverless 4.5MB request body limit
+          if (outUrl.length > 2_800_000) {
+            outUrl = canvas.toDataURL('image/jpeg', 0.8);
+          }
+          if (outUrl.length > 2_800_000) {
+            outUrl = canvas.toDataURL('image/jpeg', 0.68);
+          }
           URL.revokeObjectURL(objectUrl);
           resolve(outUrl);
         } catch (err) {

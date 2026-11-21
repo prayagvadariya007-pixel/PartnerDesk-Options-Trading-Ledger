@@ -1,7 +1,9 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { Pool, type PoolClient, type QueryResultRow } from 'pg';
 import {
   buildTradeGroupKey,
   computePartnershipAndSettlement,
@@ -26,148 +28,347 @@ import type {
   TradeOrderRecord,
 } from '../shared/types.ts';
 
-const DATA_DIR = path.resolve(process.cwd(), 'data');
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
+type SqlParam = string | number | null;
+
+interface DbExecutor {
+  get<T = Record<string, unknown>>(sql: string, ...params: SqlParam[]): Promise<T | undefined>;
+  all<T = Record<string, unknown>>(sql: string, ...params: SqlParam[]): Promise<T[]>;
+  run(sql: string, ...params: SqlParam[]): Promise<{ changes: number; lastInsertRowid?: number }>;
+  insertReturningId(sql: string, ...params: SqlParam[]): Promise<number>;
 }
 
-const DB_PATH = path.join(DATA_DIR, 'partnerdesk.db');
-const db = new DatabaseSync(DB_PATH);
+const PG_URL = (process.env.POSTGRES_URL || process.env.DATABASE_URL || '').trim();
+const IS_POSTGRES = PG_URL.length > 0;
+const IS_VERCEL = process.env.VERCEL === '1' || Boolean(process.env.VERCEL_ENV);
 
-db.exec(`
-  PRAGMA journal_mode = WAL;
-  PRAGMA foreign_keys = ON;
+function toPgSql(sql: string): string {
+  let idx = 0;
+  let inSingleQuote = false;
+  let out = '';
+  for (let i = 0; i < sql.length; i++) {
+    const ch = sql[i];
+    if (ch === "'") {
+      if (inSingleQuote && sql[i + 1] === "'") {
+        out += "''";
+        i++;
+        continue;
+      }
+      inSingleQuote = !inSingleQuote;
+      out += ch;
+      continue;
+    }
+    if (ch === '?' && !inSingleQuote) {
+      idx += 1;
+      out += `$${idx}`;
+    } else {
+      out += ch;
+    }
+  }
+  return out;
+}
 
-  CREATE TABLE IF NOT EXISTS app_config (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-  );
+let sqliteDb: DatabaseSync | null = null;
+let pgPool: Pool | null = null;
+let initPromise: Promise<void> | null = null;
+let sqliteTxChain: Promise<void> = Promise.resolve();
 
-  CREATE TABLE IF NOT EXISTS uploads (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    image_hash TEXT UNIQUE NOT NULL,
-    image_data_url TEXT NOT NULL,
-    original_filename TEXT,
-    uploaded_by TEXT NOT NULL,
-    uploaded_at TEXT NOT NULL
-  );
+function getWritableSqliteDir(): string {
+  if (IS_VERCEL) {
+    return path.join(os.tmpdir(), 'partnerdesk_data');
+  }
+  const preferred = path.resolve(process.cwd(), 'data');
+  try {
+    if (!fs.existsSync(preferred)) {
+      fs.mkdirSync(preferred, { recursive: true });
+    }
+    fs.accessSync(preferred, fs.constants.W_OK);
+    return preferred;
+  } catch {
+    return path.join(os.tmpdir(), 'partnerdesk_data');
+  }
+}
 
-  CREATE TABLE IF NOT EXISTS trade_groups (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    group_key TEXT UNIQUE NOT NULL,
-    trading_date TEXT NOT NULL,
-    uploaded_at TEXT NOT NULL,
-    stock_name TEXT NOT NULL,
-    trading_symbol TEXT NOT NULL,
-    expiry_date TEXT NOT NULL,
-    strike_price REAL NOT NULL,
-    option_type TEXT NOT NULL CHECK(option_type IN ('CE', 'PE')),
-    buy_qty INTEGER NOT NULL DEFAULT 0,
-    sell_qty INTEGER NOT NULL DEFAULT 0,
-    avg_buy_price REAL NOT NULL DEFAULT 0,
-    avg_sell_price REAL NOT NULL DEFAULT 0,
-    total_buy_amount REAL NOT NULL DEFAULT 0,
-    total_sell_amount REAL NOT NULL DEFAULT 0,
-    realised_qty INTEGER NOT NULL DEFAULT 0,
-    open_qty INTEGER NOT NULL DEFAULT 0,
-    open_side TEXT,
-    gross_pnl REAL NOT NULL DEFAULT 0,
-    brokerage REAL NOT NULL DEFAULT 0,
-    stt REAL NOT NULL DEFAULT 0,
-    exchange_txn_charge REAL NOT NULL DEFAULT 0,
-    sebi_charge REAL NOT NULL DEFAULT 0,
-    stamp_duty REAL NOT NULL DEFAULT 0,
-    ipft_charge REAL NOT NULL DEFAULT 0,
-    gst REAL NOT NULL DEFAULT 0,
-    other_charges REAL NOT NULL DEFAULT 0,
-    total_charges REAL NOT NULL DEFAULT 0,
-    net_pnl REAL NOT NULL DEFAULT 0,
-    charges_mode TEXT NOT NULL DEFAULT 'ESTIMATED' CHECK(charges_mode IN ('ESTIMATED', 'CONTRACT_NOTE')),
-    contract_note_ref TEXT,
-    notes TEXT,
-    updated_at TEXT NOT NULL
-  );
+async function initDatabase(): Promise<void> {
+  if (IS_POSTGRES) {
+    const sslDisabled = /sslmode=disable/i.test(PG_URL);
+    const needsSsl =
+      !sslDisabled &&
+      (/sslmode=(require|verify-ca|verify-full|prefer)/i.test(PG_URL) ||
+        /neon\.tech|supabase\.|vercel-storage|amazonaws\.com/i.test(PG_URL) ||
+        IS_VERCEL);
 
-  CREATE TABLE IF NOT EXISTS orders (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    trade_group_id INTEGER NOT NULL REFERENCES trade_groups(id) ON DELETE CASCADE,
-    upload_id INTEGER REFERENCES uploads(id) ON DELETE SET NULL,
-    trading_date TEXT NOT NULL,
-    uploaded_at TEXT NOT NULL,
-    stock_name TEXT NOT NULL,
-    trading_symbol TEXT NOT NULL,
-    expiry_date TEXT NOT NULL,
-    strike_price REAL NOT NULL,
-    option_type TEXT NOT NULL CHECK(option_type IN ('CE', 'PE')),
-    side TEXT NOT NULL CHECK(side IN ('BUY', 'SELL')),
-    quantity INTEGER NOT NULL,
-    lots INTEGER,
-    execution_price REAL NOT NULL,
-    amount REAL NOT NULL,
-    execution_time TEXT NOT NULL,
-    created_by TEXT NOT NULL,
-    created_at TEXT NOT NULL
-  );
+    pgPool = new Pool({
+      connectionString: PG_URL,
+      max: 5,
+      idleTimeoutMillis: 10000,
+      connectionTimeoutMillis: 15000,
+      ...(needsSsl ? { ssl: { rejectUnauthorized: false } } : {}),
+    });
 
-  CREATE TABLE IF NOT EXISTS group_screenshots (
-    trade_group_id INTEGER NOT NULL REFERENCES trade_groups(id) ON DELETE CASCADE,
-    upload_id INTEGER NOT NULL REFERENCES uploads(id) ON DELETE CASCADE,
-    PRIMARY KEY (trade_group_id, upload_id)
-  );
+    await pgPool.query(`
+      CREATE TABLE IF NOT EXISTS app_config (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
 
-  CREATE TABLE IF NOT EXISTS deposits (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    partner TEXT NOT NULL CHECK(partner IN ('Prayag', 'Raj')),
-    entry_type TEXT NOT NULL DEFAULT 'DEPOSIT' CHECK(entry_type IN ('DEPOSIT', 'WITHDRAWAL')),
-    amount REAL NOT NULL CHECK(amount > 0),
-    deposit_date TEXT NOT NULL,
-    reference_note TEXT,
-    created_by TEXT NOT NULL,
-    created_at TEXT NOT NULL
-  );
+      CREATE TABLE IF NOT EXISTS uploads (
+        id SERIAL PRIMARY KEY,
+        image_hash TEXT UNIQUE NOT NULL,
+        image_data_url TEXT NOT NULL,
+        original_filename TEXT,
+        uploaded_by TEXT NOT NULL,
+        uploaded_at TEXT NOT NULL
+      );
 
-  CREATE TABLE IF NOT EXISTS settlements (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    settlement_date TEXT NOT NULL,
-    idempotency_key TEXT UNIQUE NOT NULL,
-    settled_gross_pnl REAL NOT NULL,
-    settled_total_charges REAL NOT NULL,
-    settled_net_pnl REAL NOT NULL,
-    owner_profit_share REAL NOT NULL,
-    raj_profit_share REAL NOT NULL,
-    owner_outstanding_before REAL NOT NULL,
-    raj_outstanding_before REAL NOT NULL,
-    owner_outstanding_adjusted REAL NOT NULL,
-    raj_outstanding_adjusted REAL NOT NULL,
-    owner_remaining_outstanding REAL NOT NULL,
-    raj_remaining_outstanding REAL NOT NULL,
-    owner_payable REAL NOT NULL,
-    raj_payable REAL NOT NULL,
-    notes TEXT,
-    created_by TEXT NOT NULL,
-    created_at TEXT NOT NULL
-  );
+      CREATE TABLE IF NOT EXISTS trade_groups (
+        id SERIAL PRIMARY KEY,
+        group_key TEXT UNIQUE NOT NULL,
+        trading_date TEXT NOT NULL,
+        uploaded_at TEXT NOT NULL,
+        stock_name TEXT NOT NULL,
+        trading_symbol TEXT NOT NULL,
+        expiry_date TEXT NOT NULL,
+        strike_price DOUBLE PRECISION NOT NULL,
+        option_type TEXT NOT NULL CHECK(option_type IN ('CE', 'PE')),
+        buy_qty INTEGER NOT NULL DEFAULT 0,
+        sell_qty INTEGER NOT NULL DEFAULT 0,
+        avg_buy_price DOUBLE PRECISION NOT NULL DEFAULT 0,
+        avg_sell_price DOUBLE PRECISION NOT NULL DEFAULT 0,
+        total_buy_amount DOUBLE PRECISION NOT NULL DEFAULT 0,
+        total_sell_amount DOUBLE PRECISION NOT NULL DEFAULT 0,
+        realised_qty INTEGER NOT NULL DEFAULT 0,
+        open_qty INTEGER NOT NULL DEFAULT 0,
+        open_side TEXT,
+        gross_pnl DOUBLE PRECISION NOT NULL DEFAULT 0,
+        brokerage DOUBLE PRECISION NOT NULL DEFAULT 0,
+        stt DOUBLE PRECISION NOT NULL DEFAULT 0,
+        exchange_txn_charge DOUBLE PRECISION NOT NULL DEFAULT 0,
+        sebi_charge DOUBLE PRECISION NOT NULL DEFAULT 0,
+        stamp_duty DOUBLE PRECISION NOT NULL DEFAULT 0,
+        ipft_charge DOUBLE PRECISION NOT NULL DEFAULT 0,
+        gst DOUBLE PRECISION NOT NULL DEFAULT 0,
+        other_charges DOUBLE PRECISION NOT NULL DEFAULT 0,
+        total_charges DOUBLE PRECISION NOT NULL DEFAULT 0,
+        net_pnl DOUBLE PRECISION NOT NULL DEFAULT 0,
+        charges_mode TEXT NOT NULL DEFAULT 'ESTIMATED' CHECK(charges_mode IN ('ESTIMATED', 'CONTRACT_NOTE')),
+        contract_note_ref TEXT,
+        notes TEXT,
+        updated_at TEXT NOT NULL
+      );
 
-  CREATE TABLE IF NOT EXISTS audit_logs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    actor TEXT NOT NULL,
-    action TEXT NOT NULL,
-    entity_type TEXT NOT NULL,
-    entity_id TEXT,
-    summary TEXT NOT NULL,
-    details_json TEXT,
-    created_at TEXT NOT NULL
-  );
-`);
+      CREATE TABLE IF NOT EXISTS orders (
+        id SERIAL PRIMARY KEY,
+        trade_group_id INTEGER NOT NULL REFERENCES trade_groups(id) ON DELETE CASCADE,
+        upload_id INTEGER REFERENCES uploads(id) ON DELETE SET NULL,
+        trading_date TEXT NOT NULL,
+        uploaded_at TEXT NOT NULL,
+        stock_name TEXT NOT NULL,
+        trading_symbol TEXT NOT NULL,
+        expiry_date TEXT NOT NULL,
+        strike_price DOUBLE PRECISION NOT NULL,
+        option_type TEXT NOT NULL CHECK(option_type IN ('CE', 'PE')),
+        side TEXT NOT NULL CHECK(side IN ('BUY', 'SELL')),
+        quantity INTEGER NOT NULL,
+        lots INTEGER,
+        execution_price DOUBLE PRECISION NOT NULL,
+        amount DOUBLE PRECISION NOT NULL,
+        execution_time TEXT NOT NULL,
+        created_by TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
 
-// Safe migration if deposits table was previously created with 'Owner'
-{
-  const tbl = db
+      CREATE TABLE IF NOT EXISTS group_screenshots (
+        trade_group_id INTEGER NOT NULL REFERENCES trade_groups(id) ON DELETE CASCADE,
+        upload_id INTEGER NOT NULL REFERENCES uploads(id) ON DELETE CASCADE,
+        PRIMARY KEY (trade_group_id, upload_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS deposits (
+        id SERIAL PRIMARY KEY,
+        partner TEXT NOT NULL CHECK(partner IN ('Prayag', 'Raj')),
+        entry_type TEXT NOT NULL DEFAULT 'DEPOSIT' CHECK(entry_type IN ('DEPOSIT', 'WITHDRAWAL')),
+        amount DOUBLE PRECISION NOT NULL CHECK(amount > 0),
+        deposit_date TEXT NOT NULL,
+        reference_note TEXT,
+        created_by TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS settlements (
+        id SERIAL PRIMARY KEY,
+        settlement_date TEXT NOT NULL,
+        idempotency_key TEXT UNIQUE NOT NULL,
+        settled_gross_pnl DOUBLE PRECISION NOT NULL,
+        settled_total_charges DOUBLE PRECISION NOT NULL,
+        settled_net_pnl DOUBLE PRECISION NOT NULL,
+        owner_profit_share DOUBLE PRECISION NOT NULL,
+        raj_profit_share DOUBLE PRECISION NOT NULL,
+        owner_outstanding_before DOUBLE PRECISION NOT NULL,
+        raj_outstanding_before DOUBLE PRECISION NOT NULL,
+        owner_outstanding_adjusted DOUBLE PRECISION NOT NULL,
+        raj_outstanding_adjusted DOUBLE PRECISION NOT NULL,
+        owner_remaining_outstanding DOUBLE PRECISION NOT NULL,
+        raj_remaining_outstanding DOUBLE PRECISION NOT NULL,
+        owner_payable DOUBLE PRECISION NOT NULL,
+        raj_payable DOUBLE PRECISION NOT NULL,
+        notes TEXT,
+        created_by TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS audit_logs (
+        id SERIAL PRIMARY KEY,
+        actor TEXT NOT NULL,
+        action TEXT NOT NULL,
+        entity_type TEXT NOT NULL,
+        entity_id TEXT,
+        summary TEXT NOT NULL,
+        details_json TEXT,
+        created_at TEXT NOT NULL
+      );
+    `);
+    return;
+  }
+
+  const dataDir = getWritableSqliteDir();
+  if (!fs.existsSync(dataDir)) {
+    fs.mkdirSync(dataDir, { recursive: true });
+  }
+  const dbPath = path.join(dataDir, 'partnerdesk.db');
+  sqliteDb = new DatabaseSync(dbPath);
+  sqliteDb.exec(`
+    PRAGMA journal_mode = WAL;
+    PRAGMA foreign_keys = ON;
+
+    CREATE TABLE IF NOT EXISTS app_config (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS uploads (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      image_hash TEXT UNIQUE NOT NULL,
+      image_data_url TEXT NOT NULL,
+      original_filename TEXT,
+      uploaded_by TEXT NOT NULL,
+      uploaded_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS trade_groups (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      group_key TEXT UNIQUE NOT NULL,
+      trading_date TEXT NOT NULL,
+      uploaded_at TEXT NOT NULL,
+      stock_name TEXT NOT NULL,
+      trading_symbol TEXT NOT NULL,
+      expiry_date TEXT NOT NULL,
+      strike_price REAL NOT NULL,
+      option_type TEXT NOT NULL CHECK(option_type IN ('CE', 'PE')),
+      buy_qty INTEGER NOT NULL DEFAULT 0,
+      sell_qty INTEGER NOT NULL DEFAULT 0,
+      avg_buy_price REAL NOT NULL DEFAULT 0,
+      avg_sell_price REAL NOT NULL DEFAULT 0,
+      total_buy_amount REAL NOT NULL DEFAULT 0,
+      total_sell_amount REAL NOT NULL DEFAULT 0,
+      realised_qty INTEGER NOT NULL DEFAULT 0,
+      open_qty INTEGER NOT NULL DEFAULT 0,
+      open_side TEXT,
+      gross_pnl REAL NOT NULL DEFAULT 0,
+      brokerage REAL NOT NULL DEFAULT 0,
+      stt REAL NOT NULL DEFAULT 0,
+      exchange_txn_charge REAL NOT NULL DEFAULT 0,
+      sebi_charge REAL NOT NULL DEFAULT 0,
+      stamp_duty REAL NOT NULL DEFAULT 0,
+      ipft_charge REAL NOT NULL DEFAULT 0,
+      gst REAL NOT NULL DEFAULT 0,
+      other_charges REAL NOT NULL DEFAULT 0,
+      total_charges REAL NOT NULL DEFAULT 0,
+      net_pnl REAL NOT NULL DEFAULT 0,
+      charges_mode TEXT NOT NULL DEFAULT 'ESTIMATED' CHECK(charges_mode IN ('ESTIMATED', 'CONTRACT_NOTE')),
+      contract_note_ref TEXT,
+      notes TEXT,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS orders (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      trade_group_id INTEGER NOT NULL REFERENCES trade_groups(id) ON DELETE CASCADE,
+      upload_id INTEGER REFERENCES uploads(id) ON DELETE SET NULL,
+      trading_date TEXT NOT NULL,
+      uploaded_at TEXT NOT NULL,
+      stock_name TEXT NOT NULL,
+      trading_symbol TEXT NOT NULL,
+      expiry_date TEXT NOT NULL,
+      strike_price REAL NOT NULL,
+      option_type TEXT NOT NULL CHECK(option_type IN ('CE', 'PE')),
+      side TEXT NOT NULL CHECK(side IN ('BUY', 'SELL')),
+      quantity INTEGER NOT NULL,
+      lots INTEGER,
+      execution_price REAL NOT NULL,
+      amount REAL NOT NULL,
+      execution_time TEXT NOT NULL,
+      created_by TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS group_screenshots (
+      trade_group_id INTEGER NOT NULL REFERENCES trade_groups(id) ON DELETE CASCADE,
+      upload_id INTEGER NOT NULL REFERENCES uploads(id) ON DELETE CASCADE,
+      PRIMARY KEY (trade_group_id, upload_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS deposits (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      partner TEXT NOT NULL CHECK(partner IN ('Prayag', 'Raj')),
+      entry_type TEXT NOT NULL DEFAULT 'DEPOSIT' CHECK(entry_type IN ('DEPOSIT', 'WITHDRAWAL')),
+      amount REAL NOT NULL CHECK(amount > 0),
+      deposit_date TEXT NOT NULL,
+      reference_note TEXT,
+      created_by TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS settlements (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      settlement_date TEXT NOT NULL,
+      idempotency_key TEXT UNIQUE NOT NULL,
+      settled_gross_pnl REAL NOT NULL,
+      settled_total_charges REAL NOT NULL,
+      settled_net_pnl REAL NOT NULL,
+      owner_profit_share REAL NOT NULL,
+      raj_profit_share REAL NOT NULL,
+      owner_outstanding_before REAL NOT NULL,
+      raj_outstanding_before REAL NOT NULL,
+      owner_outstanding_adjusted REAL NOT NULL,
+      raj_outstanding_adjusted REAL NOT NULL,
+      owner_remaining_outstanding REAL NOT NULL,
+      raj_remaining_outstanding REAL NOT NULL,
+      owner_payable REAL NOT NULL,
+      raj_payable REAL NOT NULL,
+      notes TEXT,
+      created_by TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS audit_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      actor TEXT NOT NULL,
+      action TEXT NOT NULL,
+      entity_type TEXT NOT NULL,
+      entity_id TEXT,
+      summary TEXT NOT NULL,
+      details_json TEXT,
+      created_at TEXT NOT NULL
+    );
+  `);
+
+  const tbl = sqliteDb
     .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'deposits'")
     .get() as { sql?: string } | undefined;
   if (tbl?.sql && tbl.sql.includes("'Owner'")) {
-    db.exec(`
+    sqliteDb.exec(`
       BEGIN IMMEDIATE;
       CREATE TABLE deposits_new (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -193,15 +394,133 @@ db.exec(`
     `);
   }
 
-  const depCols = db.prepare('PRAGMA table_info(deposits)').all() as { name: string }[];
+  const depCols = sqliteDb.prepare('PRAGMA table_info(deposits)').all() as { name: string }[];
   if (!depCols.some((c) => c.name === 'entry_type')) {
-    db.exec("ALTER TABLE deposits ADD COLUMN entry_type TEXT NOT NULL DEFAULT 'DEPOSIT'");
+    sqliteDb.exec("ALTER TABLE deposits ADD COLUMN entry_type TEXT NOT NULL DEFAULT 'DEPOSIT'");
   }
 
-  db.exec(`
+  sqliteDb.exec(`
     INSERT OR IGNORE INTO group_screenshots (trade_group_id, upload_id)
     SELECT DISTINCT trade_group_id, upload_id FROM orders WHERE upload_id IS NOT NULL;
   `);
+}
+
+export async function ensureDbReady(): Promise<void> {
+  if (!initPromise) {
+    initPromise = initDatabase().catch((err) => {
+      initPromise = null;
+      throw err;
+    });
+  }
+  await initPromise;
+}
+
+function makeSqliteExecutor(db: DatabaseSync): DbExecutor {
+  return {
+    async get<T>(sql: string, ...params: SqlParam[]): Promise<T | undefined> {
+      return db.prepare(sql).get(...params) as T | undefined;
+    },
+    async all<T>(sql: string, ...params: SqlParam[]): Promise<T[]> {
+      return db.prepare(sql).all(...params) as T[];
+    },
+    async run(sql: string, ...params: SqlParam[]) {
+      const res = db.prepare(sql).run(...params);
+      return {
+        changes: Number(res.changes ?? 0),
+        lastInsertRowid:
+          res.lastInsertRowid !== undefined ? Number(res.lastInsertRowid) : undefined,
+      };
+    },
+    async insertReturningId(sql: string, ...params: SqlParam[]): Promise<number> {
+      const res = db.prepare(sql).run(...params);
+      return Number(res.lastInsertRowid);
+    },
+  };
+}
+
+function makePgExecutor(runner: Pool | PoolClient): DbExecutor {
+  return {
+    async get<T>(sql: string, ...params: SqlParam[]): Promise<T | undefined> {
+      const res = await runner.query<QueryResultRow>(toPgSql(sql), params);
+      return res.rows[0] as T | undefined;
+    },
+    async all<T>(sql: string, ...params: SqlParam[]): Promise<T[]> {
+      const res = await runner.query<QueryResultRow>(toPgSql(sql), params);
+      return res.rows as T[];
+    },
+    async run(sql: string, ...params: SqlParam[]) {
+      const res = await runner.query(toPgSql(sql), params);
+      return { changes: Number(res.rowCount ?? 0) };
+    },
+    async insertReturningId(sql: string, ...params: SqlParam[]): Promise<number> {
+      const cleaned = sql.trim().replace(/;+$/, '');
+      const withReturning = /\bRETURNING\b/i.test(cleaned) ? cleaned : `${cleaned} RETURNING id`;
+      const res = await runner.query<{ id: number | string }>(toPgSql(withReturning), params);
+      return Number(res.rows[0]?.id);
+    },
+  };
+}
+
+async function getExecutor(): Promise<DbExecutor> {
+  await ensureDbReady();
+  if (IS_POSTGRES) {
+    return makePgExecutor(pgPool!);
+  }
+  return makeSqliteExecutor(sqliteDb!);
+}
+
+async function runInTransaction<T>(fn: (tx: DbExecutor) => Promise<T>): Promise<T> {
+  await ensureDbReady();
+  if (IS_POSTGRES) {
+    const client = await pgPool!.connect();
+    try {
+      await client.query('BEGIN');
+      const tx = makePgExecutor(client);
+      const result = await fn(tx);
+      await client.query('COMMIT');
+      return result;
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  let releaseMutex!: () => void;
+  const previous = sqliteTxChain;
+  sqliteTxChain = new Promise<void>((resolve) => {
+    releaseMutex = resolve;
+  });
+  await previous;
+
+  const db = sqliteDb!;
+  try {
+    db.exec('BEGIN IMMEDIATE');
+    const tx = makeSqliteExecutor(db);
+    const result = await fn(tx);
+    db.exec('COMMIT');
+    return result;
+  } catch (err) {
+    try {
+      db.exec('ROLLBACK');
+    } catch {
+      // Ignore rollback error if transaction already closed
+    }
+    throw err;
+  } finally {
+    releaseMutex();
+  }
+}
+
+export function getStorageInfo(): {
+  engine: 'postgres' | 'sqlite';
+  persistent: boolean;
+} {
+  return {
+    engine: IS_POSTGRES ? 'postgres' : 'sqlite',
+    persistent: IS_POSTGRES || !IS_VERCEL,
+  };
 }
 
 // Session secret strictly in server memory fallback if SESSION_SECRET env is not set
@@ -227,37 +546,49 @@ export function verifyPasswordHash(password: string, stored: string): boolean {
   return crypto.timingSafeEqual(expected, actual);
 }
 
-export function getAuthStatus(): {
+export async function getAuthStatus(): Promise<{
   needsInitialSetup: boolean;
   envPasswordConfigured: boolean;
-} {
+}> {
   const envPass = (process.env.PARTNER_ACCESS_PASSWORD || '').trim();
   if (envPass.length > 0) {
     return { needsInitialSetup: false, envPasswordConfigured: true };
   }
-  const row = db
-    .prepare('SELECT value FROM app_config WHERE key = ?')
-    .get('partner_password_hash') as { value: string } | undefined;
+  const db = await getExecutor();
+  const row = await db.get<{ value: string }>(
+    'SELECT value FROM app_config WHERE key = ?',
+    'partner_password_hash',
+  );
   return {
     needsInitialSetup: !row,
     envPasswordConfigured: false,
   };
 }
 
-export function claimInitialPassword(password: string, actor: PartnerId): void {
-  const status = getAuthStatus();
+export async function claimInitialPassword(password: string, actor: PartnerId): Promise<void> {
+  const status = await getAuthStatus();
   if (!status.needsInitialSetup) {
     throw new Error('ALREADY_CONFIGURED');
   }
   const hash = hashPassword(password);
   const now = nowIso();
-  db.prepare(
+  const db = await getExecutor();
+  await db.run(
     'INSERT INTO app_config (key, value, updated_at) VALUES (?, ?, ?)',
-  ).run('partner_password_hash', hash, now);
-  logAudit(actor, 'SETUP_PASSWORD', 'AUTH', 'shared', 'Configured initial shared partnership password');
+    'partner_password_hash',
+    hash,
+    now,
+  );
+  await logAudit(
+    actor,
+    'SETUP_PASSWORD',
+    'AUTH',
+    'shared',
+    'Configured initial shared partnership password',
+  );
 }
 
-export function verifyPartnerPassword(password: string): boolean {
+export async function verifyPartnerPassword(password: string): Promise<boolean> {
   const envPass = (process.env.PARTNER_ACCESS_PASSWORD || '').trim();
   if (envPass.length > 0) {
     const a = Buffer.from(password, 'utf8');
@@ -265,33 +596,45 @@ export function verifyPartnerPassword(password: string): boolean {
     if (a.length !== b.length) return false;
     return crypto.timingSafeEqual(a, b);
   }
-  const row = db
-    .prepare('SELECT value FROM app_config WHERE key = ?')
-    .get('partner_password_hash') as { value: string } | undefined;
+  const db = await getExecutor();
+  const row = await db.get<{ value: string }>(
+    'SELECT value FROM app_config WHERE key = ?',
+    'partner_password_hash',
+  );
   if (!row) return false;
   return verifyPasswordHash(password, row.value);
 }
 
-export function updateSharedPassword(
+export async function updateSharedPassword(
   currentPassword: string,
   newPassword: string,
   actor: PartnerId,
-): void {
+): Promise<void> {
   const envPass = (process.env.PARTNER_ACCESS_PASSWORD || '').trim();
   if (envPass.length > 0) {
     throw new Error('ENV_PASSWORD_LOCKED');
   }
-  if (!verifyPartnerPassword(currentPassword)) {
+  if (!(await verifyPartnerPassword(currentPassword))) {
     throw new Error('INVALID_CURRENT_PASSWORD');
   }
   const hash = hashPassword(newPassword);
   const now = nowIso();
-  db.prepare(
+  const db = await getExecutor();
+  await db.run(
     `INSERT INTO app_config (key, value, updated_at)
      VALUES (?, ?, ?)
      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
-  ).run('partner_password_hash', hash, now);
-  logAudit(actor, 'UPDATE_PASSWORD', 'AUTH', 'shared', `${actor} updated the shared partnership password`);
+    'partner_password_hash',
+    hash,
+    now,
+  );
+  await logAudit(
+    actor,
+    'UPDATE_PASSWORD',
+    'AUTH',
+    'shared',
+    `${actor} updated the shared partnership password`,
+  );
 }
 
 export interface SessionPayload {
@@ -305,7 +648,7 @@ export function signSessionToken(partnerId: PartnerId): string {
   const payload: SessionPayload = {
     partnerId,
     iat: now,
-    exp: now + 60 * 60 * 12, // 12 hours
+    exp: now + 60 * 60 * 12,
   };
   const encoded = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
   const sig = crypto.createHmac('sha256', SESSION_SECRET).update(encoded).digest('base64url');
@@ -334,18 +677,19 @@ export function verifySessionToken(token: string): SessionPayload | null {
   }
 }
 
-export function logAudit(
+export async function logAudit(
   actor: string,
   action: string,
   entityType: string,
   entityId: string | null,
   summary: string,
   details?: unknown,
-): void {
-  db.prepare(
+  tx?: DbExecutor,
+): Promise<void> {
+  const db = tx || (await getExecutor());
+  await db.run(
     `INSERT INTO audit_logs (actor, action, entity_type, entity_id, summary, details_json, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
     actor,
     action,
     entityType,
@@ -356,10 +700,12 @@ export function logAudit(
   );
 }
 
-export function getChargeRates(): ChargeRates {
-  const row = db
-    .prepare('SELECT value FROM app_config WHERE key = ?')
-    .get('charge_rates') as { value: string } | undefined;
+export async function getChargeRates(tx?: DbExecutor): Promise<ChargeRates> {
+  const db = tx || (await getExecutor());
+  const row = await db.get<{ value: string }>(
+    'SELECT value FROM app_config WHERE key = ?',
+    'charge_rates',
+  );
   if (!row) return { ...DEFAULT_CHARGE_RATES };
   try {
     const parsed = JSON.parse(row.value) as Partial<ChargeRates>;
@@ -377,11 +723,11 @@ export function getChargeRates(): ChargeRates {
   }
 }
 
-export function saveChargeRates(
+export async function saveChargeRates(
   rates: ChargeRates,
   actor: PartnerId,
   recalculateEstimatedTrades = false,
-): ChargeRates {
+): Promise<ChargeRates> {
   const safeRate = (val: unknown, fallback: number) => {
     const n = Number(val);
     return Number.isFinite(n) && n >= 0 ? n : fallback;
@@ -395,51 +741,67 @@ export function saveChargeRates(
     stampDutyBuyPct: safeRate(rates.stampDutyBuyPct, DEFAULT_CHARGE_RATES.stampDutyBuyPct),
     gstPct: safeRate(rates.gstPct, DEFAULT_CHARGE_RATES.gstPct),
   };
-  const now = nowIso();
-  db.prepare(
-    `INSERT INTO app_config (key, value, updated_at)
-     VALUES (?, ?, ?)
-     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
-  ).run('charge_rates', JSON.stringify(clean), now);
 
-  if (recalculateEstimatedTrades) {
-    const groups = db
-      .prepare("SELECT id FROM trade_groups WHERE charges_mode = 'ESTIMATED'")
-      .all() as { id: number }[];
-    for (const g of groups) {
-      recomputeTradeGroup(g.id, clean);
+  await runInTransaction(async (tx) => {
+    const now = nowIso();
+    await tx.run(
+      `INSERT INTO app_config (key, value, updated_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+      'charge_rates',
+      JSON.stringify(clean),
+      now,
+    );
+
+    if (recalculateEstimatedTrades) {
+      const groups = await tx.all<{ id: number }>(
+        "SELECT id FROM trade_groups WHERE charges_mode = 'ESTIMATED'",
+      );
+      for (const g of groups) {
+        await recomputeTradeGroup(Number(g.id), clean, tx);
+      }
     }
-  }
 
-  logAudit(
-    actor,
-    'UPDATE_RATES',
-    'SETTINGS',
-    'charge_rates',
-    `${actor} updated Angel One & exchange charge rates${recalculateEstimatedTrades ? ' and recalculated estimated trades' : ''}`,
-    clean,
-  );
+    await logAudit(
+      actor,
+      'UPDATE_RATES',
+      'SETTINGS',
+      'charge_rates',
+      `${actor} updated Angel One & exchange charge rates${recalculateEstimatedTrades ? ' and recalculated estimated trades' : ''}`,
+      clean,
+      tx,
+    );
+  });
+
   return clean;
 }
 
-export function checkDuplicateScreenshot(imageBase64DataUrl: string): {
+export async function checkDuplicateScreenshot(
+  imageBase64DataUrl: string,
+  tx?: DbExecutor,
+): Promise<{
   imageHash: string;
   duplicate: { id: number; uploadedBy: string; uploadedAt: string; originalFilename: string | null } | null;
-} {
+}> {
   const raw = imageBase64DataUrl.includes(',')
     ? imageBase64DataUrl.split(',')[1]
     : imageBase64DataUrl;
   const imageHash = crypto.createHash('sha256').update(Buffer.from(raw, 'base64')).digest('hex');
-  const row = db
-    .prepare('SELECT id, uploaded_by, uploaded_at, original_filename FROM uploads WHERE image_hash = ?')
-    .get(imageHash) as
-    | { id: number; uploaded_by: string; uploaded_at: string; original_filename: string | null }
-    | undefined;
+  const db = tx || (await getExecutor());
+  const row = await db.get<{
+    id: number;
+    uploaded_by: string;
+    uploaded_at: string;
+    original_filename: string | null;
+  }>(
+    'SELECT id, uploaded_by, uploaded_at, original_filename FROM uploads WHERE image_hash = ?',
+    imageHash,
+  );
   return {
     imageHash,
     duplicate: row
       ? {
-          id: row.id,
+          id: Number(row.id),
           uploadedBy: row.uploaded_by,
           uploadedAt: row.uploaded_at,
           originalFilename: row.original_filename,
@@ -509,23 +871,30 @@ function mapTradeGroupRow(row: Record<string, unknown>): TradeGroupRecord {
   };
 }
 
-export function recomputeTradeGroup(tradeGroupId: number, ratesOverride?: ChargeRates): TradeGroupRecord | null {
-  const groupRow = db
-    .prepare('SELECT * FROM trade_groups WHERE id = ?')
-    .get(tradeGroupId) as Record<string, unknown> | undefined;
+export async function recomputeTradeGroup(
+  tradeGroupId: number,
+  ratesOverride?: ChargeRates,
+  tx?: DbExecutor,
+): Promise<TradeGroupRecord | null> {
+  const db = tx || (await getExecutor());
+  const groupRow = await db.get<Record<string, unknown>>(
+    'SELECT * FROM trade_groups WHERE id = ?',
+    tradeGroupId,
+  );
   if (!groupRow) return null;
 
-  const orderRows = db
-    .prepare('SELECT * FROM orders WHERE trade_group_id = ? ORDER BY id ASC')
-    .all(tradeGroupId) as Record<string, unknown>[];
+  const orderRows = await db.all<Record<string, unknown>>(
+    'SELECT * FROM orders WHERE trade_group_id = ? ORDER BY id ASC',
+    tradeGroupId,
+  );
 
   if (orderRows.length === 0) {
-    db.prepare('DELETE FROM trade_groups WHERE id = ?').run(tradeGroupId);
+    await db.run('DELETE FROM trade_groups WHERE id = ?', tradeGroupId);
     return null;
   }
 
   const orders = orderRows.map(mapOrderRow);
-  const rates = ratesOverride || getChargeRates();
+  const rates = ratesOverride || (await getChargeRates(db));
   const existing = mapTradeGroupRow(groupRow);
 
   const contractOverride =
@@ -554,7 +923,7 @@ export function recomputeTradeGroup(tradeGroupId: number, ratesOverride?: Charge
   );
 
   const now = nowIso();
-  db.prepare(
+  await db.run(
     `UPDATE trade_groups SET
       buy_qty = ?, sell_qty = ?, avg_buy_price = ?, avg_sell_price = ?,
       total_buy_amount = ?, total_sell_amount = ?, realised_qty = ?, open_qty = ?, open_side = ?,
@@ -562,7 +931,6 @@ export function recomputeTradeGroup(tradeGroupId: number, ratesOverride?: Charge
       stamp_duty = ?, ipft_charge = ?, gst = ?, other_charges = ?, total_charges = ?,
       net_pnl = ?, updated_at = ?
      WHERE id = ?`,
-  ).run(
     computed.buyQty,
     computed.sellQty,
     computed.avgBuyPrice,
@@ -587,52 +955,55 @@ export function recomputeTradeGroup(tradeGroupId: number, ratesOverride?: Charge
     tradeGroupId,
   );
 
-  return getTradeGroupById(tradeGroupId);
+  return getTradeGroupById(tradeGroupId, db);
 }
 
-export function saveUploadedOrders(params: {
+export async function saveUploadedOrders(params: {
   actor: PartnerId;
   screenshotDataUrl?: string | null;
   originalFilename?: string | null;
   orders: ExtractedOrderLeg[];
-}): {
+}): Promise<{
   uploadId: number | null;
   uploadedAt: string;
   affectedTrades: TradeGroupRecord[];
-} {
+}> {
   const uploadedAt = nowIso();
-  let uploadId: number | null = null;
 
-  db.exec('BEGIN IMMEDIATE');
-  try {
+  return runInTransaction(async (tx) => {
+    let uploadId: number | null = null;
+
     if (params.screenshotDataUrl && params.screenshotDataUrl.trim().length > 0) {
-      const { imageHash, duplicate } = checkDuplicateScreenshot(params.screenshotDataUrl);
+      const { imageHash, duplicate } = await checkDuplicateScreenshot(
+        params.screenshotDataUrl,
+        tx,
+      );
       if (duplicate) {
         throw new Error(
           `DUPLICATE_SCREENSHOT:${duplicate.uploadedAt}:${duplicate.uploadedBy}`,
         );
       }
-      const insertUpload = db
-        .prepare(
-          `INSERT INTO uploads (image_hash, image_data_url, original_filename, uploaded_by, uploaded_at)
-           VALUES (?, ?, ?, ?, ?)`,
-        )
-        .run(
-          imageHash,
-          params.screenshotDataUrl,
-          params.originalFilename || null,
-          params.actor,
-          uploadedAt,
-        );
-      uploadId = Number(insertUpload.lastInsertRowid);
+      uploadId = await tx.insertReturningId(
+        `INSERT INTO uploads (image_hash, image_data_url, original_filename, uploaded_by, uploaded_at)
+         VALUES (?, ?, ?, ?, ?)`,
+        imageHash,
+        params.screenshotDataUrl,
+        params.originalFilename || null,
+        params.actor,
+        uploadedAt,
+      );
     }
 
-    const rates = getChargeRates();
+    const rates = await getChargeRates(tx);
     const touchedGroupIds = new Set<number>();
 
     for (const leg of params.orders) {
       const stockName = leg.stockName.trim().toUpperCase();
-      const tradingSymbol = (leg.tradingSymbol || `${stockName} ${leg.strikePrice} ${leg.optionType}`).trim().toUpperCase();
+      const tradingSymbol = (
+        leg.tradingSymbol || `${stockName} ${leg.strikePrice} ${leg.optionType}`
+      )
+        .trim()
+        .toUpperCase();
       const tradingDate = leg.tradingDate.trim();
       const expiryDate = leg.expiryDate.trim();
       const strikePrice = Number(leg.strikePrice);
@@ -649,40 +1020,39 @@ export function saveUploadedOrders(params: {
         optionType,
       });
 
-      let existingGroup = db
-        .prepare('SELECT id FROM trade_groups WHERE group_key = ?')
-        .get(groupKey) as { id: number } | undefined;
+      let existingGroup = await tx.get<{ id: number }>(
+        'SELECT id FROM trade_groups WHERE group_key = ?',
+        groupKey,
+      );
 
+      let groupId: number;
       if (!existingGroup) {
-        const res = db
-          .prepare(
-            `INSERT INTO trade_groups (
-              group_key, trading_date, uploaded_at, stock_name, trading_symbol, expiry_date,
-              strike_price, option_type, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          )
-          .run(
-            groupKey,
-            tradingDate,
-            uploadedAt,
-            stockName,
-            tradingSymbol,
-            expiryDate,
-            strikePrice,
-            optionType,
-            uploadedAt,
-          );
-        existingGroup = { id: Number(res.lastInsertRowid) };
+        groupId = await tx.insertReturningId(
+          `INSERT INTO trade_groups (
+            group_key, trading_date, uploaded_at, stock_name, trading_symbol, expiry_date,
+            strike_price, option_type, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          groupKey,
+          tradingDate,
+          uploadedAt,
+          stockName,
+          tradingSymbol,
+          expiryDate,
+          strikePrice,
+          optionType,
+          uploadedAt,
+        );
+      } else {
+        groupId = Number(existingGroup.id);
       }
 
-      db.prepare(
+      await tx.run(
         `INSERT INTO orders (
           trade_group_id, upload_id, trading_date, uploaded_at, stock_name, trading_symbol,
           expiry_date, strike_price, option_type, side, quantity, lots, execution_price,
           amount, execution_time, created_by, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      ).run(
-        existingGroup.id,
+        groupId,
         uploadId,
         tradingDate,
         uploadedAt,
@@ -702,21 +1072,23 @@ export function saveUploadedOrders(params: {
       );
 
       if (uploadId !== null) {
-        db.prepare(
-          'INSERT OR IGNORE INTO group_screenshots (trade_group_id, upload_id) VALUES (?, ?)',
-        ).run(existingGroup.id, uploadId);
+        await tx.run(
+          'INSERT INTO group_screenshots (trade_group_id, upload_id) VALUES (?, ?) ON CONFLICT DO NOTHING',
+          groupId,
+          uploadId,
+        );
       }
 
-      touchedGroupIds.add(existingGroup.id);
+      touchedGroupIds.add(groupId);
     }
 
     const affectedTrades: TradeGroupRecord[] = [];
     for (const gid of touchedGroupIds) {
-      const updated = recomputeTradeGroup(gid, rates);
+      const updated = await recomputeTradeGroup(gid, rates, tx);
       if (updated) affectedTrades.push(updated);
     }
 
-    logAudit(
+    await logAudit(
       params.actor,
       'SAVE_TRADE',
       'TRADE',
@@ -727,83 +1099,101 @@ export function saveUploadedOrders(params: {
         orderCount: params.orders.length,
         symbols: affectedTrades.map((t) => `${t.stockName} ${t.strikePrice} ${t.optionType}`),
       },
+      tx,
     );
 
-    db.exec('COMMIT');
     return { uploadId, uploadedAt, affectedTrades };
-  } catch (err) {
-    db.exec('ROLLBACK');
-    throw err;
-  }
-}
-
-export function listTradeGroups(): TradeGroupRecord[] {
-  const rows = db
-    .prepare('SELECT * FROM trade_groups ORDER BY trading_date DESC, id DESC')
-    .all() as Record<string, unknown>[];
-  return rows.map((row) => {
-    const group = mapTradeGroupRow(row);
-    const orderRows = db
-      .prepare('SELECT * FROM orders WHERE trade_group_id = ? ORDER BY id ASC')
-      .all(group.id) as Record<string, unknown>[];
-    group.orders = orderRows.map(mapOrderRow);
-    const uploadRows = db
-      .prepare(
-        `SELECT DISTINCT u.id, u.image_data_url, u.original_filename, u.uploaded_by, u.uploaded_at
-         FROM uploads u
-         WHERE u.id IN (
-           SELECT upload_id FROM group_screenshots WHERE trade_group_id = ?
-           UNION
-           SELECT upload_id FROM orders WHERE trade_group_id = ? AND upload_id IS NOT NULL
-         )
-         ORDER BY u.id DESC`,
-      )
-      .all(group.id, group.id) as {
-      id: number;
-      image_data_url: string;
-      original_filename: string | null;
-      uploaded_by: string;
-      uploaded_at: string;
-    }[];
-    group.screenshots = uploadRows.map((u) => ({
-      id: Number(u.id),
-      imageDataUrl: u.image_data_url,
-      originalFilename: u.original_filename,
-      uploadedBy: u.uploaded_by as PartnerId,
-      uploadedAt: u.uploaded_at,
-    }));
-    return group;
   });
 }
 
-export function getTradeGroupById(id: number): TradeGroupRecord | null {
-  const row = db.prepare('SELECT * FROM trade_groups WHERE id = ?').get(id) as
-    | Record<string, unknown>
-    | undefined;
-  if (!row) return null;
-  const group = mapTradeGroupRow(row);
-  const orderRows = db
-    .prepare('SELECT * FROM orders WHERE trade_group_id = ? ORDER BY id ASC')
-    .all(id) as Record<string, unknown>[];
-  group.orders = orderRows.map(mapOrderRow);
-  const uploadRows = db
-    .prepare(
-      `SELECT DISTINCT u.id, u.image_data_url, u.original_filename, u.uploaded_by, u.uploaded_at
-       FROM uploads u
-       WHERE u.id IN (
-         SELECT upload_id FROM group_screenshots WHERE trade_group_id = ?
-         UNION
-         SELECT upload_id FROM orders WHERE trade_group_id = ? AND upload_id IS NOT NULL
-       )
-       ORDER BY u.id DESC`,
-    )
-    .all(id, id) as {
+export async function listTradeGroups(tx?: DbExecutor): Promise<TradeGroupRecord[]> {
+  const db = tx || (await getExecutor());
+  const rows = await db.all<Record<string, unknown>>(
+    'SELECT * FROM trade_groups ORDER BY trading_date DESC, id DESC',
+  );
+  if (rows.length === 0) return [];
+
+  const allOrderRows = await db.all<Record<string, unknown>>(
+    'SELECT * FROM orders ORDER BY id ASC',
+  );
+  const ordersByGroup = new Map<number, TradeOrderRecord[]>();
+  for (const r of allOrderRows) {
+    const mapped = mapOrderRow(r);
+    const list = ordersByGroup.get(mapped.tradeGroupId) || [];
+    list.push(mapped);
+    ordersByGroup.set(mapped.tradeGroupId, list);
+  }
+
+  const screenshotLinks = await db.all<{
+    trade_group_id: number;
     id: number;
     image_data_url: string;
     original_filename: string | null;
     uploaded_by: string;
     uploaded_at: string;
-  }[];
+  }>(
+    `SELECT DISTINCT links.trade_group_id, u.id, u.image_data_url, u.original_filename, u.uploaded_by, u.uploaded_at
+     FROM (
+       SELECT trade_group_id, upload_id FROM group_screenshots
+       UNION
+       SELECT trade_group_id, upload_id FROM orders WHERE upload_id IS NOT NULL
+     ) links
+     JOIN uploads u ON u.id = links.upload_id
+     ORDER BY u.id DESC`,
+  );
+  const screenshotsByGroup = new Map<number, TradeGroupRecord['screenshots']>();
+  for (const u of screenshotLinks) {
+    const gid = Number(u.trade_group_id);
+    const list = screenshotsByGroup.get(gid) || [];
+    list.push({
+      id: Number(u.id),
+      imageDataUrl: u.image_data_url,
+      originalFilename: u.original_filename,
+      uploadedBy: u.uploaded_by as PartnerId,
+      uploadedAt: u.uploaded_at,
+    });
+    screenshotsByGroup.set(gid, list);
+  }
+
+  return rows.map((row) => {
+    const group = mapTradeGroupRow(row);
+    group.orders = ordersByGroup.get(group.id) || [];
+    group.screenshots = screenshotsByGroup.get(group.id) || [];
+    return group;
+  });
+}
+
+export async function getTradeGroupById(
+  id: number,
+  tx?: DbExecutor,
+): Promise<TradeGroupRecord | null> {
+  const db = tx || (await getExecutor());
+  const row = await db.get<Record<string, unknown>>('SELECT * FROM trade_groups WHERE id = ?', id);
+  if (!row) return null;
+  const group = mapTradeGroupRow(row);
+  const orderRows = await db.all<Record<string, unknown>>(
+    'SELECT * FROM orders WHERE trade_group_id = ? ORDER BY id ASC',
+    id,
+  );
+  group.orders = orderRows.map(mapOrderRow);
+  const uploadRows = await db.all<{
+    id: number;
+    image_data_url: string;
+    original_filename: string | null;
+    uploaded_by: string;
+    uploaded_at: string;
+  }>(
+    `SELECT DISTINCT u.id, u.image_data_url, u.original_filename, u.uploaded_by, u.uploaded_at
+     FROM uploads u
+     WHERE u.id IN (
+       SELECT upload_id FROM group_screenshots WHERE trade_group_id = ?
+       UNION
+       SELECT upload_id FROM orders WHERE trade_group_id = ? AND upload_id IS NOT NULL
+     )
+     ORDER BY u.id DESC`,
+    id,
+    id,
+  );
   group.screenshots = uploadRows.map((u) => ({
     id: Number(u.id),
     imageDataUrl: u.image_data_url,
@@ -814,7 +1204,7 @@ export function getTradeGroupById(id: number): TradeGroupRecord | null {
   return group;
 }
 
-export function updateTradeGroupDetails(
+export async function updateTradeGroupDetails(
   id: number,
   actor: PartnerId,
   payload: {
@@ -847,12 +1237,11 @@ export function updateTradeGroupDetails(
       otherCharges?: number;
     };
   },
-): TradeGroupRecord | null {
-  const existing = getTradeGroupById(id);
-  if (!existing) return null;
+): Promise<TradeGroupRecord | null> {
+  return runInTransaction(async (tx) => {
+    const existing = await getTradeGroupById(id, tx);
+    if (!existing) return null;
 
-  db.exec('BEGIN IMMEDIATE');
-  try {
     const tradingDate = payload.tradingDate ?? existing.tradingDate;
     const stockName = (payload.stockName ?? existing.stockName).trim().toUpperCase();
     const tradingSymbol = (payload.tradingSymbol ?? existing.tradingSymbol).trim().toUpperCase();
@@ -869,12 +1258,11 @@ export function updateTradeGroupDetails(
     });
 
     const now = nowIso();
-    db.prepare(
+    await tx.run(
       `UPDATE trade_groups SET
         group_key = ?, trading_date = ?, stock_name = ?, trading_symbol = ?,
         expiry_date = ?, strike_price = ?, option_type = ?, notes = ?, updated_at = ?
        WHERE id = ?`,
-    ).run(
       groupKey,
       tradingDate,
       stockName,
@@ -895,20 +1283,19 @@ export function updateTradeGroupDetails(
 
       for (const oldId of existingOrderIds) {
         if (!incomingIds.has(oldId)) {
-          db.prepare('DELETE FROM orders WHERE id = ? AND trade_group_id = ?').run(oldId, id);
+          await tx.run('DELETE FROM orders WHERE id = ? AND trade_group_id = ?', oldId, id);
         }
       }
 
       for (const o of payload.orders) {
         const amt = round2(o.amount > 0 ? o.amount : o.quantity * o.executionPrice);
         if (o.id && existingOrderIds.has(o.id)) {
-          db.prepare(
+          await tx.run(
             `UPDATE orders SET
               trading_date = ?, stock_name = ?, trading_symbol = ?, expiry_date = ?,
               strike_price = ?, option_type = ?, side = ?, quantity = ?, lots = ?,
               execution_price = ?, amount = ?, execution_time = ?
              WHERE id = ? AND trade_group_id = ?`,
-          ).run(
             tradingDate,
             stockName,
             tradingSymbol,
@@ -925,13 +1312,12 @@ export function updateTradeGroupDetails(
             id,
           );
         } else {
-          db.prepare(
+          await tx.run(
             `INSERT INTO orders (
               trade_group_id, upload_id, trading_date, uploaded_at, stock_name, trading_symbol,
               expiry_date, strike_price, option_type, side, quantity, lots, execution_price,
               amount, execution_time, created_by, created_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          ).run(
             id,
             null,
             tradingDate,
@@ -953,24 +1339,30 @@ export function updateTradeGroupDetails(
         }
       }
     } else {
-      db.prepare(
+      await tx.run(
         `UPDATE orders SET
           trading_date = ?, stock_name = ?, trading_symbol = ?, expiry_date = ?,
           strike_price = ?, option_type = ?
          WHERE trade_group_id = ?`,
-      ).run(tradingDate, stockName, tradingSymbol, expiryDate, strikePrice, optionType, id);
+        tradingDate,
+        stockName,
+        tradingSymbol,
+        expiryDate,
+        strikePrice,
+        optionType,
+        id,
+      );
     }
 
     if (payload.contractNote) {
       if (payload.contractNote.mode === 'CONTRACT_NOTE') {
-        db.prepare(
+        await tx.run(
           `UPDATE trade_groups SET
             charges_mode = 'CONTRACT_NOTE',
             contract_note_ref = ?,
             brokerage = ?, stt = ?, exchange_txn_charge = ?, ipft_charge = ?,
             sebi_charge = ?, stamp_duty = ?, gst = ?, other_charges = ?, updated_at = ?
            WHERE id = ?`,
-        ).run(
           payload.contractNote.contractNoteRef || null,
           round2(payload.contractNote.brokerage ?? existing.brokerage),
           round2(payload.contractNote.stt ?? existing.stt),
@@ -984,78 +1376,75 @@ export function updateTradeGroupDetails(
           id,
         );
       } else {
-        db.prepare(
+        await tx.run(
           `UPDATE trade_groups SET charges_mode = 'ESTIMATED', contract_note_ref = NULL, other_charges = 0, updated_at = ? WHERE id = ?`,
-        ).run(now, id);
+          now,
+          id,
+        );
       }
     }
 
-    const updated = recomputeTradeGroup(id);
-    logAudit(
+    const updated = await recomputeTradeGroup(id, undefined, tx);
+    await logAudit(
       actor,
       payload.contractNote ? 'RECONCILE_TRADE' : 'UPDATE_TRADE',
       'TRADE',
       String(id),
       `${actor} updated trade ${stockName} ${strikePrice} ${optionType} (${tradingDate})`,
+      undefined,
+      tx,
     );
 
-    db.exec('COMMIT');
     return updated;
-  } catch (err) {
-    db.exec('ROLLBACK');
-    throw err;
-  }
+  });
 }
 
-export function deleteTradeGroup(id: number, actor: PartnerId): boolean {
-  const existing = getTradeGroupById(id);
-  if (!existing) return false;
+export async function deleteTradeGroup(id: number, actor: PartnerId): Promise<boolean> {
+  return runInTransaction(async (tx) => {
+    const existing = await getTradeGroupById(id, tx);
+    if (!existing) return false;
 
-  db.exec('BEGIN IMMEDIATE');
-  try {
-    const uploadIds = db
-      .prepare(
-        `SELECT upload_id FROM group_screenshots WHERE trade_group_id = ?
-         UNION
-         SELECT DISTINCT upload_id FROM orders WHERE trade_group_id = ? AND upload_id IS NOT NULL`,
-      )
-      .all(id, id) as { upload_id: number }[];
+    const uploadIds = await tx.all<{ upload_id: number }>(
+      `SELECT upload_id FROM group_screenshots WHERE trade_group_id = ?
+       UNION
+       SELECT DISTINCT upload_id FROM orders WHERE trade_group_id = ? AND upload_id IS NOT NULL`,
+      id,
+      id,
+    );
 
-    db.prepare('DELETE FROM trade_groups WHERE id = ?').run(id);
+    await tx.run('DELETE FROM trade_groups WHERE id = ?', id);
 
     for (const u of uploadIds) {
-      const stillInOrders = db
-        .prepare('SELECT 1 FROM orders WHERE upload_id = ? LIMIT 1')
-        .get(u.upload_id);
-      const stillInLinks = db
-        .prepare('SELECT 1 FROM group_screenshots WHERE upload_id = ? LIMIT 1')
-        .get(u.upload_id);
+      const uid = Number(u.upload_id);
+      const stillInOrders = await tx.get('SELECT 1 FROM orders WHERE upload_id = ? LIMIT 1', uid);
+      const stillInLinks = await tx.get(
+        'SELECT 1 FROM group_screenshots WHERE upload_id = ? LIMIT 1',
+        uid,
+      );
       if (!stillInOrders && !stillInLinks) {
-        db.prepare('DELETE FROM uploads WHERE id = ?').run(u.upload_id);
+        await tx.run('DELETE FROM uploads WHERE id = ?', uid);
       }
     }
 
-    logAudit(
+    await logAudit(
       actor,
       'DELETE_TRADE',
       'TRADE',
       String(id),
       `${actor} deleted trade ${existing.stockName} ${existing.strikePrice} ${existing.optionType} (${existing.tradingDate})`,
       { grossPnl: existing.grossPnl, netPnl: existing.netPnl },
+      tx,
     );
 
-    db.exec('COMMIT');
     return true;
-  } catch (err) {
-    db.exec('ROLLBACK');
-    throw err;
-  }
+  });
 }
 
-export function listDeposits(): DepositRecord[] {
-  const rows = db
-    .prepare('SELECT * FROM deposits ORDER BY deposit_date DESC, id DESC')
-    .all() as Record<string, unknown>[];
+export async function listDeposits(tx?: DbExecutor): Promise<DepositRecord[]> {
+  const db = tx || (await getExecutor());
+  const rows = await db.all<Record<string, unknown>>(
+    'SELECT * FROM deposits ORDER BY deposit_date DESC, id DESC',
+  );
   return rows.map((r) => ({
     id: Number(r.id),
     partner: String(r.partner) as PartnerId,
@@ -1068,26 +1457,25 @@ export function listDeposits(): DepositRecord[] {
   }));
 }
 
-export function addDeposit(params: {
+export async function addDeposit(params: {
   partner: PartnerId;
   entryType?: FundEntryType;
   amount: number;
   depositDate: string;
   referenceNote?: string | null;
   actor: PartnerId;
-}): DepositRecord {
+}): Promise<DepositRecord> {
   const cleanAmt = round2(Number(params.amount));
   if (!Number.isFinite(cleanAmt) || cleanAmt <= 0) {
     throw new Error('INVALID_AMOUNT');
   }
   const entryType: FundEntryType = params.entryType === 'WITHDRAWAL' ? 'WITHDRAWAL' : 'DEPOSIT';
   const now = nowIso();
-  const res = db
-    .prepare(
+
+  return runInTransaction(async (tx) => {
+    const id = await tx.insertReturningId(
       `INSERT INTO deposits (partner, entry_type, amount, deposit_date, reference_note, created_by, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    )
-    .run(
       params.partner,
       entryType,
       cleanAmt,
@@ -1096,50 +1484,57 @@ export function addDeposit(params: {
       params.actor,
       now,
     );
-  const id = Number(res.lastInsertRowid);
-  logAudit(
-    params.actor,
-    entryType === 'WITHDRAWAL' ? 'WITHDRAWAL_RECORDED' : 'ADD_DEPOSIT',
-    'DEPOSIT',
-    String(id),
-    entryType === 'WITHDRAWAL'
-      ? `${params.actor} recorded ₹${cleanAmt.toLocaleString('en-IN')} fund withdrawal for ${params.partner}`
-      : `${params.actor} recorded ₹${cleanAmt.toLocaleString('en-IN')} capital deposit for ${params.partner}`,
-    { partner: params.partner, entryType, amount: cleanAmt, depositDate: params.depositDate },
-  );
-  return {
-    id,
-    partner: params.partner,
-    entryType,
-    amount: cleanAmt,
-    depositDate: params.depositDate,
-    referenceNote: params.referenceNote?.trim() || null,
-    createdBy: params.actor,
-    createdAt: now,
-  };
+    await logAudit(
+      params.actor,
+      entryType === 'WITHDRAWAL' ? 'WITHDRAWAL_RECORDED' : 'ADD_DEPOSIT',
+      'DEPOSIT',
+      String(id),
+      entryType === 'WITHDRAWAL'
+        ? `${params.actor} recorded ₹${cleanAmt.toLocaleString('en-IN')} fund withdrawal for ${params.partner}`
+        : `${params.actor} recorded ₹${cleanAmt.toLocaleString('en-IN')} capital deposit for ${params.partner}`,
+      { partner: params.partner, entryType, amount: cleanAmt, depositDate: params.depositDate },
+      tx,
+    );
+    return {
+      id,
+      partner: params.partner,
+      entryType,
+      amount: cleanAmt,
+      depositDate: params.depositDate,
+      referenceNote: params.referenceNote?.trim() || null,
+      createdBy: params.actor,
+      createdAt: now,
+    };
+  });
 }
 
-export function deleteDeposit(id: number, actor: PartnerId): boolean {
-  const existing = db.prepare('SELECT * FROM deposits WHERE id = ?').get(id) as
-    | Record<string, unknown>
-    | undefined;
-  if (!existing) return false;
-  const isWithdrawal = existing.entry_type === 'WITHDRAWAL';
-  db.prepare('DELETE FROM deposits WHERE id = ?').run(id);
-  logAudit(
-    actor,
-    isWithdrawal ? 'WITHDRAWAL_DELETED' : 'DELETE_DEPOSIT',
-    'DEPOSIT',
-    String(id),
-    `${actor} removed ${isWithdrawal ? 'withdrawal' : 'deposit'} #${id} (₹${Number(existing.amount).toLocaleString('en-IN')} by ${existing.partner})`,
-  );
-  return true;
+export async function deleteDeposit(id: number, actor: PartnerId): Promise<boolean> {
+  return runInTransaction(async (tx) => {
+    const existing = await tx.get<Record<string, unknown>>(
+      'SELECT * FROM deposits WHERE id = ?',
+      id,
+    );
+    if (!existing) return false;
+    const isWithdrawal = existing.entry_type === 'WITHDRAWAL';
+    await tx.run('DELETE FROM deposits WHERE id = ?', id);
+    await logAudit(
+      actor,
+      isWithdrawal ? 'WITHDRAWAL_DELETED' : 'DELETE_DEPOSIT',
+      'DEPOSIT',
+      String(id),
+      `${actor} removed ${isWithdrawal ? 'withdrawal' : 'deposit'} #${id} (₹${Number(existing.amount).toLocaleString('en-IN')} by ${existing.partner})`,
+      undefined,
+      tx,
+    );
+    return true;
+  });
 }
 
-export function listSettlements(): SettlementRecord[] {
-  const rows = db
-    .prepare('SELECT * FROM settlements ORDER BY settlement_date DESC, id DESC')
-    .all() as Record<string, unknown>[];
+export async function listSettlements(tx?: DbExecutor): Promise<SettlementRecord[]> {
+  const db = tx || (await getExecutor());
+  const rows = await db.all<Record<string, unknown>>(
+    'SELECT * FROM settlements ORDER BY settlement_date DESC, id DESC',
+  );
   return rows.map((r) => ({
     id: Number(r.id),
     settlementDate: String(r.settlement_date),
@@ -1163,31 +1558,33 @@ export function listSettlements(): SettlementRecord[] {
   }));
 }
 
-export function getSettlementPreview(): SettlementPreview {
-  const trades = listTradeGroups();
-  const deposits = listDeposits();
-  const settlements = listSettlements();
+export async function getSettlementPreview(): Promise<SettlementPreview> {
+  const [trades, deposits, settlements] = await Promise.all([
+    listTradeGroups(),
+    listDeposits(),
+    listSettlements(),
+  ]);
   return computePartnershipAndSettlement(trades, deposits, settlements);
 }
 
-export function createSettlement(params: {
+export async function createSettlement(params: {
   settlementDate: string;
   idempotencyKey: string;
   notes?: string | null;
   actor: PartnerId;
-}): SettlementRecord {
-  const existingByKey = db
-    .prepare('SELECT id FROM settlements WHERE idempotency_key = ?')
-    .get(params.idempotencyKey);
-  if (existingByKey) {
-    throw new Error('DUPLICATE_SETTLEMENT');
-  }
+}): Promise<SettlementRecord> {
+  return runInTransaction(async (tx) => {
+    const existingByKey = await tx.get(
+      'SELECT id FROM settlements WHERE idempotency_key = ?',
+      params.idempotencyKey,
+    );
+    if (existingByKey) {
+      throw new Error('DUPLICATE_SETTLEMENT');
+    }
 
-  db.exec('BEGIN IMMEDIATE');
-  try {
-    const trades = listTradeGroups();
-    const deposits = listDeposits();
-    const settlements = listSettlements();
+    const trades = await listTradeGroups(tx);
+    const deposits = await listDeposits(tx);
+    const settlements = await listSettlements(tx);
     const preview = computePartnershipAndSettlement(trades, deposits, settlements);
 
     if (!preview.canSettle) {
@@ -1200,49 +1597,45 @@ export function createSettlement(params: {
     const settledChargesDelta = round2(preview.totalRealisedCharges - settledChargesPrior);
 
     const now = nowIso();
-    const res = db
-      .prepare(
-        `INSERT INTO settlements (
-          settlement_date, idempotency_key, settled_gross_pnl, settled_total_charges,
-          settled_net_pnl, owner_profit_share, raj_profit_share,
-          owner_outstanding_before, raj_outstanding_before,
-          owner_outstanding_adjusted, raj_outstanding_adjusted,
-          owner_remaining_outstanding, raj_remaining_outstanding,
-          owner_payable, raj_payable, notes, created_by, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        params.settlementDate,
-        params.idempotencyKey,
-        settledGrossDelta,
-        settledChargesDelta,
-        preview.unsettledNetPnl,
-        preview.ownerProfitShare,
-        preview.rajProfitShare,
-        preview.ownerOutstandingBefore,
-        preview.rajOutstandingBefore,
-        preview.ownerOutstandingAdjusted,
-        preview.rajOutstandingAdjusted,
-        preview.ownerRemainingOutstanding,
-        preview.rajRemainingOutstanding,
-        preview.ownerPayable,
-        preview.rajPayable,
-        params.notes?.trim() || null,
-        params.actor,
-        now,
-      );
+    const id = await tx.insertReturningId(
+      `INSERT INTO settlements (
+        settlement_date, idempotency_key, settled_gross_pnl, settled_total_charges,
+        settled_net_pnl, owner_profit_share, raj_profit_share,
+        owner_outstanding_before, raj_outstanding_before,
+        owner_outstanding_adjusted, raj_outstanding_adjusted,
+        owner_remaining_outstanding, raj_remaining_outstanding,
+        owner_payable, raj_payable, notes, created_by, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      params.settlementDate,
+      params.idempotencyKey,
+      settledGrossDelta,
+      settledChargesDelta,
+      preview.unsettledNetPnl,
+      preview.ownerProfitShare,
+      preview.rajProfitShare,
+      preview.ownerOutstandingBefore,
+      preview.rajOutstandingBefore,
+      preview.ownerOutstandingAdjusted,
+      preview.rajOutstandingAdjusted,
+      preview.ownerRemainingOutstanding,
+      preview.rajRemainingOutstanding,
+      preview.ownerPayable,
+      preview.rajPayable,
+      params.notes?.trim() || null,
+      params.actor,
+      now,
+    );
 
-    const id = Number(res.lastInsertRowid);
-    logAudit(
+    await logAudit(
       params.actor,
       'CREATE_SETTLEMENT',
       'SETTLEMENT',
       String(id),
       `${params.actor} confirmed settlement #${id}: Net ₹${preview.unsettledNetPnl.toLocaleString('en-IN')} (Prayag payable ₹${preview.ownerPayable.toLocaleString('en-IN')}, Raj payable ₹${preview.rajPayable.toLocaleString('en-IN')})`,
       preview,
+      tx,
     );
 
-    db.exec('COMMIT');
     return {
       id,
       settlementDate: params.settlementDate,
@@ -1264,23 +1657,22 @@ export function createSettlement(params: {
       createdBy: params.actor,
       createdAt: now,
     };
-  } catch (err) {
-    db.exec('ROLLBACK');
-    throw err;
-  }
+  });
 }
 
-export function getDashboardSummary(): {
+export async function getDashboardSummary(): Promise<{
   summary: DashboardSummary;
   settlementPreview: SettlementPreview;
   recentTrades: TradeGroupRecord[];
   openPositions: TradeGroupRecord[];
   recentDeposits: DepositRecord[];
   recentSettlements: SettlementRecord[];
-} {
-  const trades = listTradeGroups();
-  const deposits = listDeposits();
-  const settlements = listSettlements();
+}> {
+  const [trades, deposits, settlements] = await Promise.all([
+    listTradeGroups(),
+    listDeposits(),
+    listSettlements(),
+  ]);
   const preview = computePartnershipAndSettlement(trades, deposits, settlements);
 
   const totalBuyAmount = round2(trades.reduce((s, t) => s + t.totalBuyAmount, 0));
@@ -1332,10 +1724,12 @@ export function getDashboardSummary(): {
   };
 }
 
-export function listAuditLogs(limit = 100): AuditLogRecord[] {
-  const rows = db
-    .prepare('SELECT * FROM audit_logs ORDER BY id DESC LIMIT ?')
-    .all(limit) as Record<string, unknown>[];
+export async function listAuditLogs(limit = 100, tx?: DbExecutor): Promise<AuditLogRecord[]> {
+  const db = tx || (await getExecutor());
+  const rows = await db.all<Record<string, unknown>>(
+    'SELECT * FROM audit_logs ORDER BY id DESC LIMIT ?',
+    limit,
+  );
   return rows.map((r) => ({
     id: Number(r.id),
     actor: String(r.actor),
@@ -1367,32 +1761,32 @@ export interface ServerBackupPayload {
   auditLogs: AuditLogRecord[];
 }
 
-export function exportServerBackupPayload(): ServerBackupPayload {
-  const uploadRows = db
-    .prepare('SELECT id, image_hash, image_data_url, original_filename, uploaded_by, uploaded_at FROM uploads ORDER BY id ASC')
-    .all() as {
-    id: number;
-    image_hash: string;
-    image_data_url: string;
-    original_filename: string | null;
-    uploaded_by: string;
-    uploaded_at: string;
-  }[];
-
-  const groupRows = db
-    .prepare('SELECT * FROM trade_groups ORDER BY trading_date DESC, id DESC')
-    .all() as Record<string, unknown>[];
-
-  const orderRows = db
-    .prepare('SELECT * FROM orders ORDER BY id ASC')
-    .all() as Record<string, unknown>[];
+export async function exportServerBackupPayload(): Promise<ServerBackupPayload> {
+  const db = await getExecutor();
+  const [uploadRows, groupRows, orderRows, chargeRates, deposits, auditLogs] = await Promise.all([
+    db.all<{
+      id: number;
+      image_hash: string;
+      image_data_url: string;
+      original_filename: string | null;
+      uploaded_by: string;
+      uploaded_at: string;
+    }>(
+      'SELECT id, image_hash, image_data_url, original_filename, uploaded_by, uploaded_at FROM uploads ORDER BY id ASC',
+    ),
+    db.all<Record<string, unknown>>('SELECT * FROM trade_groups ORDER BY trading_date DESC, id DESC'),
+    db.all<Record<string, unknown>>('SELECT * FROM orders ORDER BY id ASC'),
+    getChargeRates(db),
+    listDeposits(db),
+    listAuditLogs(500, db),
+  ]);
 
   return {
     format: 'partnerdesk-local-backup-v1',
     folderName: 'PartnerDesk_Data',
     exportedAt: nowIso(),
-    chargeRates: getChargeRates(),
-    deposits: listDeposits(),
+    chargeRates,
+    deposits,
     uploads: uploadRows.map((u) => ({
       id: Number(u.id),
       imageHash: u.image_hash,
@@ -1403,30 +1797,28 @@ export function exportServerBackupPayload(): ServerBackupPayload {
     })),
     tradeGroups: groupRows.map(mapTradeGroupRow),
     orders: orderRows.map(mapOrderRow),
-    auditLogs: listAuditLogs(500),
+    auditLogs,
   };
 }
 
-export function mergeServerBackupPayload(
+export async function mergeServerBackupPayload(
   payload: Partial<ServerBackupPayload>,
   actor: PartnerId,
-): { addedTrades: number; addedDeposits: number; addedScreenshots: number } {
+): Promise<{ addedTrades: number; addedDeposits: number; addedScreenshots: number }> {
   const uploadsInput = Array.isArray(payload.uploads) ? payload.uploads : [];
   const groupsInput = Array.isArray(payload.tradeGroups) ? payload.tradeGroups : [];
   const ordersInput = Array.isArray(payload.orders) ? payload.orders : [];
   const depositsInput = Array.isArray(payload.deposits) ? payload.deposits : [];
 
-  const uploadIdRemap = new Map<number, number>();
-  const groupIdRemap = new Map<number, number>();
-  const touchedGroupIds = new Set<number>();
+  return runInTransaction(async (tx) => {
+    const uploadIdRemap = new Map<number, number>();
+    const groupIdRemap = new Map<number, number>();
+    const touchedGroupIds = new Set<number>();
 
-  let addedScreenshots = 0;
-  let addedTrades = 0;
-  let addedDeposits = 0;
+    let addedScreenshots = 0;
+    let addedTrades = 0;
+    let addedDeposits = 0;
 
-  db.exec('BEGIN IMMEDIATE');
-  try {
-    // 1. Merge uploads deduplicated by byte SHA-256 hash
     for (const u of uploadsInput) {
       if (!u || typeof u.imageDataUrl !== 'string' || !u.imageDataUrl.trim()) continue;
       const raw = u.imageDataUrl.includes(',') ? u.imageDataUrl.split(',')[1] : u.imageDataUrl;
@@ -1434,31 +1826,27 @@ export function mergeServerBackupPayload(
         .createHash('sha256')
         .update(Buffer.from(raw, 'base64'))
         .digest('hex');
-      const existing = db
-        .prepare('SELECT id FROM uploads WHERE image_hash = ?')
-        .get(computedHash) as { id: number } | undefined;
+      const existing = await tx.get<{ id: number }>(
+        'SELECT id FROM uploads WHERE image_hash = ?',
+        computedHash,
+      );
       if (existing) {
-        if (typeof u.id === 'number') uploadIdRemap.set(u.id, existing.id);
+        if (typeof u.id === 'number') uploadIdRemap.set(u.id, Number(existing.id));
       } else {
-        const res = db
-          .prepare(
-            `INSERT INTO uploads (image_hash, image_data_url, original_filename, uploaded_by, uploaded_at)
-             VALUES (?, ?, ?, ?, ?)`,
-          )
-          .run(
-            computedHash,
-            u.imageDataUrl,
-            u.originalFilename || null,
-            u.uploadedBy === 'Raj' ? 'Raj' : 'Prayag',
-            u.uploadedAt || nowIso(),
-          );
-        const newId = Number(res.lastInsertRowid);
+        const newId = await tx.insertReturningId(
+          `INSERT INTO uploads (image_hash, image_data_url, original_filename, uploaded_by, uploaded_at)
+           VALUES (?, ?, ?, ?, ?)`,
+          computedHash,
+          u.imageDataUrl,
+          u.originalFilename || null,
+          u.uploadedBy === 'Raj' ? 'Raj' : 'Prayag',
+          u.uploadedAt || nowIso(),
+        );
         if (typeof u.id === 'number') uploadIdRemap.set(u.id, newId);
         addedScreenshots += 1;
       }
     }
 
-    // 2. Merge trade groups deduplicated by groupKey
     for (const g of groupsInput) {
       if (!g || typeof g.stockName !== 'string' || typeof g.tradingDate !== 'string') continue;
       const cleanKey = buildTradeGroupKey({
@@ -1468,65 +1856,61 @@ export function mergeServerBackupPayload(
         strikePrice: Number(g.strikePrice),
         optionType: g.optionType === 'PE' ? 'PE' : 'CE',
       });
-      const existing = db
-        .prepare('SELECT id FROM trade_groups WHERE group_key = ?')
-        .get(cleanKey) as { id: number } | undefined;
+      const existing = await tx.get<{ id: number }>(
+        'SELECT id FROM trade_groups WHERE group_key = ?',
+        cleanKey,
+      );
       if (existing) {
-        if (typeof g.id === 'number') groupIdRemap.set(g.id, existing.id);
+        if (typeof g.id === 'number') groupIdRemap.set(g.id, Number(existing.id));
       } else {
-        const res = db
-          .prepare(
-            `INSERT INTO trade_groups (
-              group_key, trading_date, uploaded_at, stock_name, trading_symbol, expiry_date,
-              strike_price, option_type, charges_mode, contract_note_ref, notes,
-              brokerage, stt, exchange_txn_charge, sebi_charge, stamp_duty, ipft_charge, gst, other_charges,
-              updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          )
-          .run(
-            cleanKey,
-            g.tradingDate,
-            g.uploadedAt || nowIso(),
-            g.stockName.trim().toUpperCase(),
-            (g.tradingSymbol || `${g.stockName} ${g.strikePrice} ${g.optionType}`).trim().toUpperCase(),
-            g.expiryDate,
-            Number(g.strikePrice),
-            g.optionType === 'PE' ? 'PE' : 'CE',
-            g.chargesMode === 'CONTRACT_NOTE' ? 'CONTRACT_NOTE' : 'ESTIMATED',
-            g.contractNoteRef || null,
-            g.notes || null,
-            Number(g.brokerage || 0),
-            Number(g.stt || 0),
-            Number(g.exchangeTxnCharge || 0),
-            Number(g.sebiCharge || 0),
-            Number(g.stampDuty || 0),
-            Number(g.ipftCharge || 0),
-            Number(g.gst || 0),
-            Number(g.otherCharges || 0),
-            g.updatedAt || nowIso(),
-          );
-        const newId = Number(res.lastInsertRowid);
+        const newId = await tx.insertReturningId(
+          `INSERT INTO trade_groups (
+            group_key, trading_date, uploaded_at, stock_name, trading_symbol, expiry_date,
+            strike_price, option_type, charges_mode, contract_note_ref, notes,
+            brokerage, stt, exchange_txn_charge, sebi_charge, stamp_duty, ipft_charge, gst, other_charges,
+            updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          cleanKey,
+          g.tradingDate,
+          g.uploadedAt || nowIso(),
+          g.stockName.trim().toUpperCase(),
+          (g.tradingSymbol || `${g.stockName} ${g.strikePrice} ${g.optionType}`)
+            .trim()
+            .toUpperCase(),
+          g.expiryDate,
+          Number(g.strikePrice),
+          g.optionType === 'PE' ? 'PE' : 'CE',
+          g.chargesMode === 'CONTRACT_NOTE' ? 'CONTRACT_NOTE' : 'ESTIMATED',
+          g.contractNoteRef || null,
+          g.notes || null,
+          Number(g.brokerage || 0),
+          Number(g.stt || 0),
+          Number(g.exchangeTxnCharge || 0),
+          Number(g.sebiCharge || 0),
+          Number(g.stampDuty || 0),
+          Number(g.ipftCharge || 0),
+          Number(g.gst || 0),
+          Number(g.otherCharges || 0),
+          g.updatedAt || nowIso(),
+        );
         if (typeof g.id === 'number') groupIdRemap.set(g.id, newId);
         touchedGroupIds.add(newId);
         addedTrades += 1;
       }
     }
 
-    // 3. Merge individual order legs
-    const existingOrders = db
-      .prepare('SELECT trade_group_id, side, quantity, execution_price, amount, execution_time FROM orders')
-      .all() as {
+    const existingOrders = await tx.all<{
       trade_group_id: number;
       side: string;
       quantity: number;
       execution_price: number;
       amount: number;
       execution_time: string;
-    }[];
+    }>('SELECT trade_group_id, side, quantity, execution_price, amount, execution_time FROM orders');
     const orderSigs = new Set(
       existingOrders.map(
         (o) =>
-          `${o.trade_group_id}|${o.side}|${o.quantity}|${o.execution_price}|${o.amount}|${o.execution_time}`,
+          `${Number(o.trade_group_id)}|${o.side}|${Number(o.quantity)}|${Number(o.execution_price)}|${Number(o.amount)}|${o.execution_time}`,
       ),
     );
 
@@ -1545,19 +1929,20 @@ export function mergeServerBackupPayload(
 
       const sig = `${targetGroupId}|${side}|${quantity}|${executionPrice}|${amount}|${executionTime}`;
       if (!orderSigs.has(sig)) {
-        db.prepare(
+        await tx.run(
           `INSERT INTO orders (
             trade_group_id, upload_id, trading_date, uploaded_at, stock_name, trading_symbol,
             expiry_date, strike_price, option_type, side, quantity, lots, execution_price,
             amount, execution_time, created_by, created_at
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        ).run(
           targetGroupId,
           mappedUploadId,
           o.tradingDate,
           o.uploadedAt || nowIso(),
           o.stockName.trim().toUpperCase(),
-          (o.tradingSymbol || `${o.stockName} ${o.strikePrice} ${o.optionType}`).trim().toUpperCase(),
+          (o.tradingSymbol || `${o.stockName} ${o.strikePrice} ${o.optionType}`)
+            .trim()
+            .toUpperCase(),
           o.expiryDate,
           Number(o.strikePrice),
           o.optionType === 'PE' ? 'PE' : 'CE',
@@ -1575,14 +1960,15 @@ export function mergeServerBackupPayload(
       }
 
       if (mappedUploadId !== null) {
-        db.prepare(
-          'INSERT OR IGNORE INTO group_screenshots (trade_group_id, upload_id) VALUES (?, ?)',
-        ).run(targetGroupId, mappedUploadId);
+        await tx.run(
+          'INSERT INTO group_screenshots (trade_group_id, upload_id) VALUES (?, ?) ON CONFLICT DO NOTHING',
+          targetGroupId,
+          mappedUploadId,
+        );
       }
     }
 
-    // 4. Merge deposits / withdrawals deduplicated by signature
-    const existingDeps = listDeposits();
+    const existingDeps = await listDeposits(tx);
     const depSigs = new Set(
       existingDeps.map(
         (d) =>
@@ -1598,10 +1984,9 @@ export function mergeServerBackupPayload(
       const createdAt = d.createdAt || nowIso();
       const sig = `${d.depositDate}|${partner}|${entryType}|${amt}|${createdAt}`;
       if (depSigs.has(sig)) continue;
-      db.prepare(
+      await tx.run(
         `INSERT INTO deposits (partner, entry_type, amount, deposit_date, reference_note, created_by, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      ).run(
         partner,
         entryType,
         amt,
@@ -1614,25 +1999,23 @@ export function mergeServerBackupPayload(
       addedDeposits += 1;
     }
 
-    const rates = getChargeRates();
+    const rates = await getChargeRates(tx);
     for (const gid of touchedGroupIds) {
-      recomputeTradeGroup(gid, rates);
+      await recomputeTradeGroup(gid, rates, tx);
     }
 
     if (addedTrades > 0 || addedDeposits > 0 || addedScreenshots > 0) {
-      logAudit(
+      await logAudit(
         actor,
         'SYNC_MERGE',
         'BACKUP',
         null,
         `${actor} merged ${addedTrades} trade(s), ${addedDeposits} fund entry(s), ${addedScreenshots} screenshot(s) into shared ledger`,
+        undefined,
+        tx,
       );
     }
 
-    db.exec('COMMIT');
     return { addedTrades, addedDeposits, addedScreenshots };
-  } catch (err) {
-    db.exec('ROLLBACK');
-    throw err;
-  }
+  });
 }
