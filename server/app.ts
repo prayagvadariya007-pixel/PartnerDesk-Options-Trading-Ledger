@@ -53,21 +53,23 @@ function asyncHandler(
   };
 }
 
-function requireAuth(req: AuthedRequest, res: Response, next: NextFunction): void {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    res.status(401).json({ error: 'Authentication required.' });
-    return;
-  }
-  const token = authHeader.slice('Bearer '.length).trim();
-  const payload = verifySessionToken(token);
-  if (!payload) {
-    res.status(401).json({ error: 'Session expired or invalid. Please sign in again.' });
-    return;
-  }
-  req.partnerId = payload.partnerId;
-  next();
-}
+const requireAuth = asyncHandler(
+  async (req: AuthedRequest, res: Response, next: NextFunction): Promise<void> => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      res.status(401).json({ error: 'Authentication required.' });
+      return;
+    }
+    const token = authHeader.slice('Bearer '.length).trim();
+    const payload = await verifySessionToken(token);
+    if (!payload) {
+      res.status(401).json({ error: 'Session expired or invalid. Please sign in again.' });
+      return;
+    }
+    req.partnerId = payload.partnerId;
+    next();
+  },
+);
 
 export function createApiApp(): express.Express {
   const app = express();
@@ -107,7 +109,7 @@ export function createApiApp(): express.Express {
       }
       try {
         await claimInitialPassword(password, partnerId);
-        const token = signSessionToken(partnerId);
+        const token = await signSessionToken(partnerId);
         res.status(201).json({ token, partnerId });
       } catch (err) {
         if (err instanceof Error && err.message === 'ALREADY_CONFIGURED') {
@@ -139,7 +141,7 @@ export function createApiApp(): express.Express {
         res.status(401).json({ error: 'Invalid shared partnership password.' });
         return;
       }
-      const token = signSessionToken(partnerId);
+      const token = await signSessionToken(partnerId);
       res.json({ token, partnerId });
     }),
   );

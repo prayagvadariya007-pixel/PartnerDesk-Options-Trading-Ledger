@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
+import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
 import { Pool, type PoolClient, type QueryResultRow } from 'pg';
 import {
   buildTradeGroupKey,
@@ -67,10 +67,11 @@ function toPgSql(sql: string): string {
   return out;
 }
 
-let sqliteDb: DatabaseSync | null = null;
+let sqliteDb: DatabaseSyncType | null = null;
 let pgPool: Pool | null = null;
 let initPromise: Promise<void> | null = null;
 let sqliteTxChain: Promise<void> = Promise.resolve();
+let cachedSessionSecret: string | null = null;
 
 function getWritableSqliteDir(): string {
   if (IS_VERCEL) {
@@ -236,7 +237,9 @@ async function initDatabase(): Promise<void> {
     fs.mkdirSync(dataDir, { recursive: true });
   }
   const dbPath = path.join(dataDir, 'partnerdesk.db');
-  sqliteDb = new DatabaseSync(dbPath);
+  const sqliteSpecifier = 'node:sqlite';
+  const sqliteMod = (await import(sqliteSpecifier)) as typeof import('node:sqlite');
+  sqliteDb = new sqliteMod.DatabaseSync(dbPath);
   sqliteDb.exec(`
     PRAGMA journal_mode = WAL;
     PRAGMA foreign_keys = ON;
@@ -415,7 +418,7 @@ export async function ensureDbReady(): Promise<void> {
   await initPromise;
 }
 
-function makeSqliteExecutor(db: DatabaseSync): DbExecutor {
+function makeSqliteExecutor(db: DatabaseSyncType): DbExecutor {
   return {
     async get<T>(sql: string, ...params: SqlParam[]): Promise<T | undefined> {
       return db.prepare(sql).get(...params) as T | undefined;
@@ -523,8 +526,31 @@ export function getStorageInfo(): {
   };
 }
 
-// Session secret strictly in server memory fallback if SESSION_SECRET env is not set
-const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+async function getSessionSecret(): Promise<string> {
+  const envSecret = (process.env.SESSION_SECRET || '').trim();
+  if (envSecret.length > 0) return envSecret;
+  if (cachedSessionSecret) return cachedSessionSecret;
+  try {
+    const db = await getExecutor();
+    const candidate = crypto.randomBytes(32).toString('hex');
+    await db.run(
+      `INSERT INTO app_config (key, value, updated_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(key) DO NOTHING`,
+      'session_secret',
+      candidate,
+      nowIso(),
+    );
+    const row = await db.get<{ value: string }>(
+      'SELECT value FROM app_config WHERE key = ?',
+      'session_secret',
+    );
+    cachedSessionSecret = row?.value || candidate;
+  } catch {
+    cachedSessionSecret = crypto.randomBytes(32).toString('hex');
+  }
+  return cachedSessionSecret;
+}
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -549,10 +575,12 @@ export function verifyPasswordHash(password: string, stored: string): boolean {
 export async function getAuthStatus(): Promise<{
   needsInitialSetup: boolean;
   envPasswordConfigured: boolean;
+  persistent: boolean;
 }> {
+  const persistent = getStorageInfo().persistent;
   const envPass = (process.env.PARTNER_ACCESS_PASSWORD || '').trim();
   if (envPass.length > 0) {
-    return { needsInitialSetup: false, envPasswordConfigured: true };
+    return { needsInitialSetup: false, envPasswordConfigured: true, persistent };
   }
   const db = await getExecutor();
   const row = await db.get<{ value: string }>(
@@ -562,6 +590,7 @@ export async function getAuthStatus(): Promise<{
   return {
     needsInitialSetup: !row,
     envPasswordConfigured: false,
+    persistent,
   };
 }
 
@@ -643,7 +672,8 @@ export interface SessionPayload {
   exp: number;
 }
 
-export function signSessionToken(partnerId: PartnerId): string {
+export async function signSessionToken(partnerId: PartnerId): Promise<string> {
+  const secret = await getSessionSecret();
   const now = Math.floor(Date.now() / 1000);
   const payload: SessionPayload = {
     partnerId,
@@ -651,15 +681,16 @@ export function signSessionToken(partnerId: PartnerId): string {
     exp: now + 60 * 60 * 12,
   };
   const encoded = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
-  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(encoded).digest('base64url');
+  const sig = crypto.createHmac('sha256', secret).update(encoded).digest('base64url');
   return `${encoded}.${sig}`;
 }
 
-export function verifySessionToken(token: string): SessionPayload | null {
+export async function verifySessionToken(token: string): Promise<SessionPayload | null> {
+  const secret = await getSessionSecret();
   const parts = token.split('.');
   if (parts.length !== 2) return null;
   const [encoded, sig] = parts;
-  const expectedSig = crypto.createHmac('sha256', SESSION_SECRET).update(encoded).digest('base64url');
+  const expectedSig = crypto.createHmac('sha256', secret).update(encoded).digest('base64url');
   const a = Buffer.from(sig, 'utf8');
   const b = Buffer.from(expectedSig, 'utf8');
   if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {

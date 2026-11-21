@@ -169,8 +169,23 @@ export default function App() {
       <div className="relative min-h-screen flex items-center justify-center p-6 text-sm text-slate-600">
         <SunlitGalleryBackdrop />
         {globalError ? (
-          <div className="gallery-card rounded-2xl p-6 text-rose-700 max-w-md border-rose-200">
-            {globalError}
+          <div className="gallery-card rounded-2xl p-6 text-rose-700 max-w-md border-rose-200 space-y-3">
+            <div>{globalError}</div>
+            <button
+              type="button"
+              onClick={() => {
+                setGlobalError(null);
+                api
+                  .getAuthStatus()
+                  .then(setAuthStatus)
+                  .catch((err) =>
+                    setGlobalError(err instanceof Error ? err.message : 'Unable to reach server.'),
+                  );
+              }}
+              className="px-4 py-2 text-xs font-semibold text-white bg-[#111318] rounded-full cursor-pointer"
+            >
+              Retry Connection
+            </button>
           </div>
         ) : (
           <div className="gallery-card rounded-full px-5 py-2.5 text-xs font-medium text-[#111318]">
@@ -182,7 +197,15 @@ export default function App() {
   }
 
   if (!partnerId) {
-    return <LoginView authStatus={authStatus} onAuthenticated={handleAuthenticated} />;
+    return (
+      <LoginView
+        authStatus={authStatus}
+        onAuthenticated={handleAuthenticated}
+        onRefreshAuthStatus={() => {
+          api.getAuthStatus().then(setAuthStatus).catch(() => {});
+        }}
+      />
+    );
   }
 
   const currentNav = NAV_ITEMS.find((n) => n.id === activeTab)!;

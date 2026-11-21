@@ -83,6 +83,7 @@ function scheduleMirrorSync(): void {
 export interface AuthStatusResponse {
   needsInitialSetup: boolean;
   envPasswordConfigured: boolean;
+  persistent?: boolean;
 }
 
 export interface AuthSessionResponse {

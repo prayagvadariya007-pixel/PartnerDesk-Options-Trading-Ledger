@@ -9,9 +9,14 @@ import { SunlitGalleryBackdrop } from './SunlitGalleryBackdrop.tsx';
 interface LoginViewProps {
   authStatus: AuthStatusResponse;
   onAuthenticated: (token: string, partnerId: PartnerId) => void;
+  onRefreshAuthStatus?: () => void;
 }
 
-export const LoginView: React.FC<LoginViewProps> = ({ authStatus, onAuthenticated }) => {
+export const LoginView: React.FC<LoginViewProps> = ({
+  authStatus,
+  onAuthenticated,
+  onRefreshAuthStatus,
+}) => {
   const [partnerId, setPartnerId] = useState<PartnerId>('Prayag');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
@@ -46,7 +51,14 @@ export const LoginView: React.FC<LoginViewProps> = ({ authStatus, onAuthenticate
         : await api.login(partnerId, password);
       onAuthenticated(res.token, res.partnerId);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Authentication failed.');
+      const msg = err instanceof Error ? err.message : 'Authentication failed.';
+      if (
+        msg.toLowerCase().includes('not been set yet') ||
+        msg.toLowerCase().includes('already configured')
+      ) {
+        onRefreshAuthStatus?.();
+      }
+      setError(msg);
     } finally {
       setLoading(false);
     }
@@ -120,6 +132,11 @@ export const LoginView: React.FC<LoginViewProps> = ({ authStatus, onAuthenticate
                   ? 'Set the shared access password once for both Prayag and Raj.'
                   : 'Sign in as Prayag or Raj with the shared password to view and edit the exact same shared ledger.'}
               </p>
+              {authStatus.persistent === false && (
+                <div className="mt-3 p-3 text-[11px] leading-relaxed text-amber-900 bg-amber-50 border border-amber-200 rounded-2xl">
+                  Temporary Vercel storage is active. Add <span className="font-mono font-semibold">DATABASE_URL</span> (Neon/Supabase Postgres) and <span className="font-mono font-semibold">PARTNER_ACCESS_PASSWORD</span> in Vercel Environment Variables so your password and trades persist permanently.
+                </div>
+              )}
             </div>
 
             <form onSubmit={handleSubmit} className="space-y-5">
