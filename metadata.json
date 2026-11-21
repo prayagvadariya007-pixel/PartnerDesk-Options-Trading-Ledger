@@ -1,0 +1,6 @@
+{
+  "name": "PartnerDesk — Options Trading Ledger",
+  "description": "Trading partnership management system for Indian Stock Market Options (CE/PE) on Angel One with automated screenshot OCR, brokerage calculation, 50:50 accounting, and settlement tracking.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

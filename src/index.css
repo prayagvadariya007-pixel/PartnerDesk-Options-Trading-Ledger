@@ -1,0 +1,111 @@
+@import "tailwindcss";
+
+@theme {
+  --font-display: "Plus Jakarta Sans", system-ui, -apple-system, sans-serif;
+  --font-sans: "DM Sans", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+@layer base {
+  html {
+    scroll-behavior: smooth;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+
+  html,
+  body {
+    font-family: var(--font-sans);
+    background-color: #e9ecef;
+    color: #111318;
+    overflow-x: hidden;
+  }
+
+  button,
+  a,
+  input,
+  select,
+  textarea {
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4,
+  .font-display {
+    font-family: var(--font-display);
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Gallery ceramic surface — ultra-fast opaque-glass on mobile, subtle frosted blur on desktop */
+.gallery-card {
+  background: rgba(255, 255, 255, 0.94);
+  border: 1px solid rgba(17, 19, 24, 0.08);
+  box-shadow:
+    0 12px 32px -20px rgba(17, 19, 24, 0.14),
+    0 1px 0 rgba(255, 255, 255, 0.9) inset;
+}
+
+@media (min-width: 1024px) {
+  .gallery-card {
+    background: rgba(255, 255, 255, 0.88);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+  }
+}
+
+.gallery-card-dark {
+  background: linear-gradient(145deg, #171a21 0%, #101217 100%);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 0 20px 42px -22px rgba(10, 12, 16, 0.45);
+}
+
+@keyframes coinSpin3D {
+  0% {
+    transform: rotateY(0deg) translate3d(0, 0, 0);
+  }
+  50% {
+    transform: rotateY(180deg) translate3d(0, -5px, 0);
+  }
+  100% {
+    transform: rotateY(360deg) translate3d(0, 0, 0);
+  }
+}
+
+@keyframes cubeFloat {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0);
+  }
+  50% {
+    transform: translate3d(0, -6px, 0);
+  }
+}
+
+.animate-coin-spin {
+  animation: coinSpin3D 7s linear infinite;
+  transform-style: preserve-3d;
+  will-change: transform;
+}
+
+.animate-cube-float {
+  animation: cubeFloat 5.5s ease-in-out infinite;
+  will-change: transform;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  .animate-coin-spin,
+  .animate-cube-float {
+    animation: none !important;
+  }
+}
